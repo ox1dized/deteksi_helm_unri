@@ -25,7 +25,49 @@
         margin: 0;
         padding: 0;
       }
+      /* Desain Toast Notification (Notifikasi Melayang) */
+      #toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
 
+      .toast {
+        min-width: 250px;
+        padding: 15px 20px;
+        border-radius: 8px;
+        color: white;
+        font-size: 14px;
+        font-weight: 500;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        opacity: 0;
+        transform: translateX(100%);
+        animation: slideIn 0.3s forwards, fadeOut 0.4s forwards 3s; /* Menghilang otomatis setelah 3 detik */
+      }
+
+      .toast.success {
+        background-color: #10b981;
+      } /* Hijau */
+      .toast.error {
+        background-color: #ef4444;
+      } /* Merah */
+
+      @keyframes slideIn {
+        to {
+          opacity: 1;
+          transform: translateX(0);
+        }
+      }
+      @keyframes fadeOut {
+        to {
+          opacity: 0;
+          transform: translateX(100%);
+        }
+      }
       /* Header */
       header {
         background-color: var(--card-bg);
@@ -152,21 +194,36 @@
         border: 2px solid rgba(0, 0, 0, 0.2);
       }
 
-      /* Gaya untuk tombol ikon kamera di log pelanggaran */
+      /* Desain Tombol Lihat - Selaras dengan tema Dashboard */
       .snapshot-link {
         text-decoration: none;
-        background: #f8fafc;
-        border: 1px solid #e2e8f0;
-        padding: 3px 6px;
+        background-color: #f1f5f9;
+        color: var(--primary);
+        border: 1px solid #cbd5e1;
+        padding: 4px 10px;
         border-radius: 6px;
-        margin-left: 8px;
-        font-size: 14px;
-        transition: all 0.2s;
+        font-size: 12px;
+        font-weight: 500;
+        transition: all 0.15s ease-in-out;
+        display: flex;
+        align-items: center;
+        gap: 5px;
       }
 
       .snapshot-link:hover {
-        background: #e2e8f0;
-        transform: scale(1.1);
+        background-color: var(--primary);
+        color: white;
+        border-color: var(--primary);
+      }
+
+      .snapshot-link:active {
+        transform: translateY(2px) scale(0.98);
+      }
+
+      .log-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
 
       .btn-primary {
@@ -285,6 +342,7 @@
     </style>
   </head>
   <body>
+    <div id="toast-container"></div>
     <header>
       <h1>Deteksi Helm</h1>
       <div class="live-badge">
@@ -379,6 +437,16 @@
             <span>Pelanggar</span>
             <h3 id="count-no-helmet" style="color: var(--danger)">6</h3>
           </div>
+        </div>
+
+        <!-- Tombol Kontrol Harian -->
+        <div style="display: flex; gap: 10px">
+          <button class="btn btn-danger" onclick="resetData()">
+            🔄 Reset Data
+          </button>
+          <button class="btn btn-secondary" onclick="downloadRekap()">
+            📄 Unduh TXT
+          </button>
         </div>
 
         <div class="log-card">
@@ -558,30 +626,110 @@
           });
       }
 
-      function captureSnapshot() {
-        fetch("/snapshot")
-          .then((res) => res.json())
-          .then((data) => {
-            if (data.status === "success") {
-              alert("Snapshot Manual Berhasil! " + data.message);
-            } else {
-              alert("Error: " + data.message);
-            }
-          })
-          .catch((err) => console.error("Error:", err));
+      // Fungsi pembuat Toast Notification tanpa memblokir sistem
+      function showToast(message, type = "success") {
+        const container = document.getElementById("toast-container");
+        const toast = document.createElement("div");
+
+        toast.className = `toast ${type}`;
+        toast.innerHTML =
+          type === "success" ? `✅ ${message}` : `❌ ${message}`;
+
+        container.appendChild(toast);
+
+        // Hapus elemen dari memori HTML setelah animasinya selesai (sekitar 3.5 detik)
+        setTimeout(() => {
+          toast.remove();
+        }, 3500);
       }
+
+      // Fungsi Tangkap Layar Manual menggunakan Toast (bukan alert)
+      function captureSnapshot() {
+        // Karena kita menggunakan sistem Client-Side, kita bisa langsung mengunduh
+        // frame terakhir yang tampil di layar (outputImage)
+        const currentImageSrc = document.getElementById("video-stream").src;
+
+        if (!currentImageSrc || currentImageSrc === "") {
+          showToast("Video belum berjalan!", "error");
+          return;
+        }
+
+        // Membuat proses download gambar secara otomatis ke HP/Laptop
+        const link = document.createElement("a");
+        link.href = currentImageSrc;
+
+        // Format nama: manual_tahunbulan_jammenitdetik.jpg
+        const now = new Date();
+        const timeString = now
+          .toISOString()
+          .replace(/T/, "_")
+          .replace(/:/g, "")
+          .split(".")[0];
+        link.download = `manual_${timeString}.jpg`;
+
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        // Memunculkan notifikasi tanpa menghentikan stream
+        showToast("Tangkapan layar manual berhasil disimpan!");
+      }
+
+      // Jalankan kamera saat pertama web dimuat
+      document.addEventListener("DOMContentLoaded", () => {
+        startCamera();
+      });
+
+      // 1. Fungsi untuk Mereset Data Harian
+      function resetData() {
+        if (
+          confirm(
+            "Apakah Anda yakin ingin MENGHAPUS semua rekapan dan mengulangnya dari nol untuk hari ini?"
+          )
+        ) {
+          fetch(`${NGROK_URL}/reset_stats`, {
+            method: "POST",
+            headers: ngrokHeaders,
+          })
+            .then((res) => res.json())
+            .then((data) => {
+              if (data.status === "success") {
+                showToast(
+                  "Sistem berhasil dikosongkan. Siap untuk hari baru!",
+                  "success"
+                );
+                // Panggil get_stats sekali untuk langsung memperbarui angka di layar ke 0
+              }
+            })
+            .catch((err) => showToast("Gagal menghubungi server", "error"));
+        }
+      }
+
+      // 2. Fungsi untuk Mengunduh File TXT
+      function downloadRekap() {
+        window.open(`${NGROK_URL}/export_log`, "_blank");
+        showToast("Mengunduh rekapan hari ini...", "success");
+      }
+
+      // Variabel memori untuk mengecek perubahan data
+      let lastLogData = "";
 
       // Mengambil Data Statistik secara Real-Time (Tiap 1 Detik)
       setInterval(function () {
-        fetch("/get_stats")
-          .then((res) => res.json())
+        fetch(`${NGROK_URL}/get_stats`, { headers: ngrokHeaders })
+          .then((res) => {
+            if (!res.ok) throw new Error("Gagal mengambil status");
+            return res.json();
+          })
           .then((data) => {
+            // 1. Update Angka Statistik
             document.getElementById("count-total").innerText = data.stats.total;
             document.getElementById("count-helmet").innerText =
               data.stats.helmet;
             document.getElementById("count-no-helmet").innerText =
               data.stats.no_helmet;
 
+            // 2. Update Status Live/Jeda
             const liveBadge = document.querySelector(".live-badge");
             if (data.is_paused || isPausedFrontend) {
               liveBadge.style.backgroundColor = "#e2e8f0";
@@ -594,25 +742,42 @@
                 '<div class="live-dot"></div> MONITORING AKTIF';
             }
 
-            const logContainer = document.getElementById("log-container");
-            logContainer.innerHTML = "";
-            data.logs.forEach((log) => {
-              const li = document.createElement("li");
-              li.className = "log-item";
-              li.innerHTML = `
-          <span class="log-time">${log.time}</span>
-          <span class="status-badge">${log.status}</span>
-        `;
-              logContainer.appendChild(li);
-            });
+            // 3. KUNCI ANTI-FLICKER
+            const currentLogString = JSON.stringify(data.logs);
+
+            // HANYA gambar ulang tabel JIKA data berbeda dari detik sebelumnya
+            if (currentLogString !== lastLogData) {
+              const logContainer = document.getElementById("log-container");
+              logContainer.innerHTML = "";
+
+              data.logs.forEach((log) => {
+                const li = document.createElement("li");
+                li.className = "log-item";
+
+                let snapBtn = "";
+                if (log.snapshot) {
+                  snapBtn = `<a href="${NGROK_URL}/snapshots/${log.snapshot}" target="_blank" class="snapshot-link">Lihat</a>`;
+                }
+
+                // Desain Layout Terpisah (Kiri-Kanan)
+                li.innerHTML = `
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <span class="log-time" style="font-size: 11px;">${log.time}</span>
+                        <span class="status-badge" style="width: fit-content;">${log.status}</span>
+                    </div>
+                    <div>
+                        ${snapBtn}
+                    </div>
+                  `;
+                logContainer.appendChild(li);
+              });
+
+              // Simpan data terbaru ke memori
+              lastLogData = currentLogString;
+            }
           })
           .catch((err) => console.error("Error fetching stats:", err));
-      }, 1000);
-
-      // Jalankan kamera saat pertama web dimuat
-      document.addEventListener("DOMContentLoaded", () => {
-        startCamera();
-      });
+      }, 1000); // 1000 milidetik = 1 detik
     </script>
   </body>
 </html>
