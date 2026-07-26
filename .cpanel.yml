@@ -1,0 +1,5 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home/deteksih/public_html/
+    - /bin/cp templates/index.html $DEPLOYPATH/index.html
