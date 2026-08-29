@@ -358,6 +358,7 @@
             id="client-video"
             autoplay
             playsinline
+            muted
             style="display: none"
           ></video>
           <canvas id="client-canvas" style="display: none"></canvas>
@@ -479,6 +480,13 @@
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
       const imgStream = document.getElementById("video-stream");
       const selectElement = document.getElementById("camera-select");
+      
+      const NGROK_URL = "https://tingle-ceramics-unnamed.ngrok-free.dev";
+      
+      // PERBAIKAN 1: Mendeklarasikan header khusus untuk melewati halaman peringatan Ngrok
+      const ngrokHeaders = {
+        "ngrok-skip-browser-warning": "true"
+      };
 
       let currentStream = null;
       let isProcessing = false;
@@ -490,7 +498,6 @@
           currentStream.getTracks().forEach((track) => track.stop());
         }
 
-        // Default ke kamera belakang (environment) jika di HP
         const constraints = {
           video: deviceId
             ? { deviceId: { exact: deviceId } }
@@ -507,10 +514,9 @@
             video.play();
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
-            sendFrame(); // Mulai loop pengiriman frame ke backend
+            sendFrame(); 
           };
 
-          // Update daftar kamera setelah izin diberikan agar nama perangkat terbaca
           updateCameraList();
         } catch (err) {
           console.error("Error mengakses kamera:", err);
@@ -525,25 +531,24 @@
           return;
         }
 
-        // Pastikan video berjalan dan proses sebelumnya sudah selesai
         if (!isProcessing && video.readyState === video.HAVE_ENOUGH_DATA) {
           isProcessing = true;
 
-          // Gambar frame ke canvas
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-          // Kompres menjadi Base64 JPEG (kualitas 0.6 untuk keseimbangan kecepatan & kualitas)
           const dataURL = canvas.toDataURL("image/jpeg", 0.6);
 
           try {
-            const response = await fetch("/process_frame", {
+            // PERBAIKAN 2: Menambahkan ${NGROK_URL} dan menggabungkan headers
+            const response = await fetch(`${NGROK_URL}/process_frame`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { 
+                  "Content-Type": "application/json",
+                  "ngrok-skip-browser-warning": "true" 
+              },
               body: JSON.stringify({ image: dataURL }),
             });
             const data = await response.json();
 
-            // Render gambar ber-annotasi dari server ke elemen <img>
             if (data.image) {
               imgStream.src = data.image;
             }
@@ -553,7 +558,6 @@
           isProcessing = false;
         }
 
-        // Panggil ulang secepat mungkin (akan distabilkan oleh isProcessing agar tidak over-request)
         requestAnimationFrame(sendFrame);
       }
 
@@ -566,7 +570,6 @@
               (device) => device.kind === "videoinput"
             );
 
-            // Simpan value yang sedang dipilih
             const currentValue = selectElement.value;
             selectElement.innerHTML = "";
 
@@ -594,7 +597,6 @@
           .catch((err) => console.error("Error mendeteksi perangkat:", err));
       }
 
-      // Event saat tombol "Ganti Kamera" ditekan
       function changeCamera() {
         const selectedDeviceId = selectElement.value;
         if (selectedDeviceId) {
@@ -608,7 +610,8 @@
       // 4. Kontrol Dashboard & Statistik
       function pauseVideo() {
         isPausedFrontend = true;
-        fetch("/toggle_camera/pause")
+        // PERBAIKAN 3: Menambahkan NGROK_URL dan headers
+        fetch(`${NGROK_URL}/toggle_camera/pause`, { headers: ngrokHeaders })
           .then((res) => res.json())
           .then((data) => {
             if (data.status === "success")
@@ -618,7 +621,8 @@
 
       function resumeVideo() {
         isPausedFrontend = false;
-        fetch("/toggle_camera/resume")
+        // PERBAIKAN 4: Menambahkan NGROK_URL dan headers
+        fetch(`${NGROK_URL}/toggle_camera/resume`, { headers: ngrokHeaders })
           .then((res) => res.json())
           .then((data) => {
             if (data.status === "success")
@@ -626,7 +630,6 @@
           });
       }
 
-      // Fungsi pembuat Toast Notification tanpa memblokir sistem
       function showToast(message, type = "success") {
         const container = document.getElementById("toast-container");
         const toast = document.createElement("div");
@@ -637,16 +640,12 @@
 
         container.appendChild(toast);
 
-        // Hapus elemen dari memori HTML setelah animasinya selesai (sekitar 3.5 detik)
         setTimeout(() => {
           toast.remove();
         }, 3500);
       }
 
-      // Fungsi Tangkap Layar Manual menggunakan Toast (bukan alert)
       function captureSnapshot() {
-        // Karena kita menggunakan sistem Client-Side, kita bisa langsung mengunduh
-        // frame terakhir yang tampil di layar (outputImage)
         const currentImageSrc = document.getElementById("video-stream").src;
 
         if (!currentImageSrc || currentImageSrc === "") {
@@ -654,11 +653,9 @@
           return;
         }
 
-        // Membuat proses download gambar secara otomatis ke HP/Laptop
         const link = document.createElement("a");
         link.href = currentImageSrc;
 
-        // Format nama: manual_tahunbulan_jammenitdetik.jpg
         const now = new Date();
         const timeString = now
           .toISOString()
@@ -671,16 +668,13 @@
         link.click();
         document.body.removeChild(link);
 
-        // Memunculkan notifikasi tanpa menghentikan stream
         showToast("Tangkapan layar manual berhasil disimpan!");
       }
 
-      // Jalankan kamera saat pertama web dimuat
       document.addEventListener("DOMContentLoaded", () => {
         startCamera();
       });
 
-      // 1. Fungsi untuk Mereset Data Harian
       function resetData() {
         if (
           confirm(
@@ -698,23 +692,19 @@
                   "Sistem berhasil dikosongkan. Siap untuk hari baru!",
                   "success"
                 );
-                // Panggil get_stats sekali untuk langsung memperbarui angka di layar ke 0
               }
             })
             .catch((err) => showToast("Gagal menghubungi server", "error"));
         }
       }
 
-      // 2. Fungsi untuk Mengunduh File TXT
       function downloadRekap() {
         window.open(`${NGROK_URL}/export_log`, "_blank");
         showToast("Mengunduh rekapan hari ini...", "success");
       }
 
-      // Variabel memori untuk mengecek perubahan data
       let lastLogData = "";
 
-      // Mengambil Data Statistik secara Real-Time (Tiap 1 Detik)
       setInterval(function () {
         fetch(`${NGROK_URL}/get_stats`, { headers: ngrokHeaders })
           .then((res) => {
@@ -722,14 +712,12 @@
             return res.json();
           })
           .then((data) => {
-            // 1. Update Angka Statistik
             document.getElementById("count-total").innerText = data.stats.total;
             document.getElementById("count-helmet").innerText =
               data.stats.helmet;
             document.getElementById("count-no-helmet").innerText =
               data.stats.no_helmet;
 
-            // 2. Update Status Live/Jeda
             const liveBadge = document.querySelector(".live-badge");
             if (data.is_paused || isPausedFrontend) {
               liveBadge.style.backgroundColor = "#e2e8f0";
@@ -742,10 +730,8 @@
                 '<div class="live-dot"></div> MONITORING AKTIF';
             }
 
-            // 3. KUNCI ANTI-FLICKER
             const currentLogString = JSON.stringify(data.logs);
 
-            // HANYA gambar ulang tabel JIKA data berbeda dari detik sebelumnya
             if (currentLogString !== lastLogData) {
               const logContainer = document.getElementById("log-container");
               logContainer.innerHTML = "";
@@ -759,7 +745,6 @@
                   snapBtn = `<a href="${NGROK_URL}/snapshots/${log.snapshot}" target="_blank" class="snapshot-link">Lihat</a>`;
                 }
 
-                // Desain Layout Terpisah (Kiri-Kanan)
                 li.innerHTML = `
                     <div style="display: flex; flex-direction: column; gap: 6px;">
                         <span class="log-time" style="font-size: 11px;">${log.time}</span>
@@ -772,12 +757,11 @@
                 logContainer.appendChild(li);
               });
 
-              // Simpan data terbaru ke memori
               lastLogData = currentLogString;
             }
           })
           .catch((err) => console.error("Error fetching stats:", err));
-      }, 1000); // 1000 milidetik = 1 detik
+      }, 1000); 
     </script>
   </body>
 </html>

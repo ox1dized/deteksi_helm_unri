@@ -1,9 +1,10 @@
-from flask import Flask, render_template, Response, jsonify, request, send_from_directory
+from flask import Flask, render_template, Response, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 import cv2
 import os
 import base64
 import numpy as np
+import time
 from datetime import datetime
 from ultralytics import YOLO
 
@@ -12,10 +13,12 @@ app = Flask(__name__)
 CORS(app)
 
 model = YOLO('best.pt')
+last_capture_time = 0  # Menyimpan waktu terakhir kamera menjepret pelanggar
 
 counted_ids = set()
 violation_ids = set() # Untuk melacak siapa saja yang sudah difoto (agar tidak difoto berkali-kali)
 compliant_ids = set() # Untuk melacak siapa yang awalnya ditebak berhelm
+last_detection_time = 0  # <--- TAMBAHKAN BARIS INI
 stats = {"helmet": 0, "no_helmet": 0, "total": 0}
 violation_logs = []
 last_frame = None
@@ -50,7 +53,7 @@ def index():
 @app.route('/process_frame', methods=['POST'])
 def process_frame():
     global last_frame, stats, violation_logs, is_paused, paused_base64_cache
-    global counted_ids, violation_ids, compliant_ids # Tambahkan deklarasi global ini
+    global counted_ids, violation_ids, compliant_ids, last_capture_time, last_detection_time 
     
     if is_paused:
         if paused_base64_cache is not None:
@@ -66,67 +69,100 @@ def process_frame():
         nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # Anda bisa menyesuaikan ulang nilai conf dan iou jika perlu
-        results = model.track(frame, persist=True, verbose=False, conf=0.5, iou=0.45)
+        results = model.track(frame, persist=True, verbose=False, conf=0.3, iou=0.45)
+        current_time = time.time()
         
-        if results[0].boxes.id is not None:
+        # PENGHAPUSAN MEMORI OTOMATIS: 
+        # Jika tidak ada motor yang lewat selama 3 detik, bersihkan memori ID.
+        # Ini mencegah bug di mana YOLO selalu me-reset ID kembali ke 1.
+        if (current_time - last_detection_time) > 3.0:
+            counted_ids.clear()
+            violation_ids.clear()
+            compliant_ids.clear()
+
+        # JIKA ADA OBJEK TERDETEKSI DI LAYAR
+        if len(results[0].boxes) > 0:
+            last_detection_time = current_time # Reset timer jalanan kosong
             boxes = results[0].boxes
-            track_ids = boxes.id.int().cpu().tolist()
             class_ids = boxes.cls.int().cpu().tolist()
             
-            for track_id, class_id in zip(track_ids, class_ids):
-                class_name = model.names[class_id].lower()
-                is_violation = "no" in class_name or "tanpa" in class_name or "without" in class_name
-                is_compliant = "helmet" in class_name or "helm" in class_name
+            # ==============================================================
+            # SKENARIO 1: OBJEK NORMAL (Berhasil mendapatkan ID dari YOLO)
+            # ==============================================================
+            if boxes.id is not None:
+                track_ids = boxes.id.int().cpu().tolist()
                 
-                trigger_snapshot = False
-
-                if track_id not in counted_ids:
-                    # KONDISI 1: Ini pertama kalinya ID ini terlihat di layar
-                    counted_ids.add(track_id)
-                    stats["total"] += 1
+                for track_id, class_id in zip(track_ids, class_ids):
+                    class_name = model.names[class_id].lower()
+                    is_violation = "no" in class_name or "tanpa" in class_name or "without" in class_name
+                    is_compliant = "helmet" in class_name or "helm" in class_name
                     
-                    if is_violation:
-                        stats["no_helmet"] += 1
-                        violation_ids.add(track_id)
-                        trigger_snapshot = True
-                    elif is_compliant:
-                        stats["helmet"] += 1
-                        compliant_ids.add(track_id)
+                    trigger_snapshot = False
+
+                    if track_id not in counted_ids:
+                        counted_ids.add(track_id)
+                        stats["total"] += 1
                         
-                else:
-                    # KONDISI 2: ID ini sudah pernah dilacak. 
-                    # Cek apakah tebakan model berubah dari Berhelm menjadi Tanpa Helm saat objek mendekat?
-                    if is_violation and track_id not in violation_ids:
-                        
-                        # Ralat statistiknya: Kurangi angka berhelm, tambah angka pelanggar
-                        if track_id in compliant_ids:
-                            stats["helmet"] -= 1
-                            compliant_ids.remove(track_id)
+                        if is_violation:
+                            stats["no_helmet"] += 1
+                            violation_ids.add(track_id)
+                            trigger_snapshot = True
+                        elif is_compliant:
+                            stats["helmet"] += 1
+                            compliant_ids.add(track_id)
                             
-                        stats["no_helmet"] += 1
-                        violation_ids.add(track_id) # Kunci agar tidak difoto lagi
-                        trigger_snapshot = True
+                    else:
+                        if is_violation and track_id not in violation_ids:
+                            if track_id in compliant_ids:
+                                stats["helmet"] -= 1
+                                compliant_ids.remove(track_id)
+                            stats["no_helmet"] += 1
+                            violation_ids.add(track_id)
+                            trigger_snapshot = True
+                            
+                    if trigger_snapshot:
+                        hari_dict = {0: 'Senin', 1: 'Selasa', 2: 'Rabu', 3: 'Kamis', 4: 'Jumat', 5: 'Sabtu', 6: 'Minggu'}
+                        waktu_lengkap = f"{hari_dict[datetime.now().weekday()]}, {datetime.now().strftime('%d-%m-%Y | %H:%M:%S')}"
+                        
+                        annotated_snapshot = results[0].plot()
+                        saved_path = save_automatic_snapshot(annotated_snapshot, "tanpa_helm", track_id)
+                        
+                        violation_logs.insert(0, {"time": waktu_lengkap, "status": "Tanpa Helm", "snapshot": saved_path})
+                        if len(violation_logs) > 15: violation_logs.pop()
 
-                # Eksekusi fungsi tangkapan layar JIKA dipicu
-                if trigger_snapshot:
-                    hari_dict = {0: 'Senin', 1: 'Selasa', 2: 'Rabu', 3: 'Kamis', 4: 'Jumat', 5: 'Sabtu', 6: 'Minggu'}
-                    idx_hari = datetime.now().weekday()
-                    tgl_str = datetime.now().strftime("%d-%m-%Y")
-                    waktu_str = datetime.now().strftime("%H:%M:%S")
-                    waktu_lengkap = f"{hari_dict[idx_hari]}, {tgl_str} | {waktu_str}"
+            # ==============================================================
+            # SKENARIO 2: DARURAT (Motor terlalu cepat, ID gagal terbaca)
+            # ==============================================================
+            else:
+                for class_id in class_ids:
+                    class_name = model.names[class_id].lower()
+                    is_violation = "no" in class_name or "tanpa" in class_name or "without" in class_name
+                    is_compliant = "helmet" in class_name or "helm" in class_name
                     
-                    annotated_snapshot = results[0].plot()
-                    saved_path = save_automatic_snapshot(annotated_snapshot, "tanpa_helm", track_id)
-                    
-                    violation_logs.insert(0, {
-                        "time": waktu_lengkap, 
-                        "status": "Tanpa Helm",
-                        "snapshot": saved_path
-                    })
-                    
-                    if len(violation_logs) > 15:
-                        violation_logs.pop()
+                    # Gunakan cooldown 1.5 detik agar tidak spam
+                    if (current_time - last_capture_time) > 1.5:
+                        
+                        # ---> PERBAIKAN: Angka statistik kini ikut bertambah di skenario darurat
+                        stats["total"] += 1
+                        
+                        if is_violation:
+                            stats["no_helmet"] += 1
+                            
+                            # Eksekusi Jepretan
+                            hari_dict = {0: 'Senin', 1: 'Selasa', 2: 'Rabu', 3: 'Kamis', 4: 'Jumat', 5: 'Sabtu', 6: 'Minggu'}
+                            waktu_lengkap = f"{hari_dict[datetime.now().weekday()]}, {datetime.now().strftime('%d-%m-%Y | %H:%M:%S')}"
+                            
+                            annotated_snapshot = results[0].plot()
+                            saved_path = save_automatic_snapshot(annotated_snapshot, "tanpa_helm", int(current_time))
+                            
+                            violation_logs.insert(0, {"time": waktu_lengkap, "status": "Tanpa Helm", "snapshot": saved_path})
+                            if len(violation_logs) > 15: violation_logs.pop()
+                            
+                        elif is_compliant:
+                            stats["helmet"] += 1
+                            
+                        last_capture_time = current_time 
+                        break # Cukup hitung 1 objek paling jelas per frame darurat
 
         annotated_frame = results[0].plot()
         last_frame = annotated_frame 
@@ -202,7 +238,9 @@ def snapshot():
     if last_frame is not None:
         filename = f"snapshots/manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         cv2.imwrite(filename, last_frame)
-        return jsonify({"status": "success", "message": f"Gambar disimpan di folder: {filename}"})
+        # Kirim file langsung ke browser HP untuk diunduh otomatis
+        return send_file(filename, as_attachment=True)
+        # return jsonify({"status": "success", "message": f"Gambar disimpan di folder: {filename}"})
     return jsonify({"status": "error", "message": "Gagal menangkap layar."})
 
 # FITUR BARU WAJIB: Route agar website bisa mengambil dan menampilkan foto dari folder backend
