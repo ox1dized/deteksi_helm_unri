@@ -1,2 +1,4 @@
 snapshots
 ngrok.exe
+__pycache__
+metrics.txt

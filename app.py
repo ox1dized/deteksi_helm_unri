@@ -7,6 +7,10 @@ import numpy as np
 import time
 from datetime import datetime
 from ultralytics import YOLO
+import psutil
+import subprocess
+import platform
+import torch
 
 app = Flask(__name__)
 # Membuka izin komunikasi lintas domain (dari DomaiNesia ke sistem lokal Ngrok)
@@ -27,6 +31,16 @@ paused_base64_cache = None # Menambahkan variabel untuk menyimpan base64 saat je
 
 if not os.path.exists('snapshots'):
     os.makedirs('snapshots')
+
+# Add runtime/stat globals
+fps = 0.0
+last_frame_time = None
+last_latency = 0.0
+last_inference_time = 0.0
+last_cpu_percent = 0.0
+last_ram_percent = 0.0
+last_ram_used_mb = 0.0
+last_gpu_info = {"name": None, "memory_total_mb": None, "memory_used_mb": None, "utilization": None}
 
 def save_automatic_snapshot(frame, label, track_id):
     date_folder = datetime.now().strftime('%Y-%m-%d')
@@ -54,7 +68,8 @@ def index():
 def process_frame():
     global last_frame, stats, violation_logs, is_paused, paused_base64_cache
     global counted_ids, violation_ids, compliant_ids, last_capture_time, last_detection_time 
-    
+    global fps, last_frame_time, last_latency, last_inference_time
+
     if is_paused:
         if paused_base64_cache is not None:
             return jsonify({"image": paused_base64_cache})
@@ -65,16 +80,38 @@ def process_frame():
         return jsonify({"error": "No image data"}), 400
 
     try:
+        frame_process_start = time.time()   # start total latency timer
+
         encoded_data = data.split(',')[1]
         nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+        # Measure inference time separately
+        infer_start = time.time()
         results = model.track(frame, persist=True, verbose=False, conf=0.3, iou=0.45)
+        infer_end = time.time()
+        inference_time = infer_end - infer_start
+
         current_time = time.time()
-        
+
+        # Compute per-frame latency (total processing until here will include subsequent steps too)
+        # We'll compute total after finishing encoding below.
+        # Update FPS using time since last processed frame (instantaneous)
+        if last_frame_time is None:
+            frame_interval = None
+        else:
+            frame_interval = frame_process_start - last_frame_time
+
+        if frame_interval and frame_interval > 0:
+            inst_fps = 1.0 / frame_interval
+            # Exponential moving average for stability
+            fps = 0.9 * fps + 0.1 * inst_fps if fps > 0 else inst_fps
+        elif fps == 0.0:
+            fps = 0.0
+
+        last_frame_time = frame_process_start
+
         # PENGHAPUSAN MEMORI OTOMATIS: 
-        # Jika tidak ada motor yang lewat selama 3 detik, bersihkan memori ID.
-        # Ini mencegah bug di mana YOLO selalu me-reset ID kembali ke 1.
         if (current_time - last_detection_time) > 3.0:
             counted_ids.clear()
             violation_ids.clear()
@@ -166,13 +203,41 @@ def process_frame():
 
         annotated_frame = results[0].plot()
         last_frame = annotated_frame 
-        
+
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
         _, buffer = cv2.imencode('.jpg', annotated_frame, encode_param)
         result_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
         paused_base64_cache = result_b64
-        
-        return jsonify({"image": result_b64})
+
+        frame_process_end = time.time()
+        total_latency = frame_process_end - frame_process_start
+
+        # update globals for admin metrics
+        last_latency = total_latency
+        last_inference_time = inference_time
+
+        # collect system stats
+        system = _collect_system_stats()
+
+        # Simpan metrik ke file log (append)
+        try:
+            with open("metrics.txt", "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().isoformat()} | fps={round(fps,2)} | latency_s={round(last_latency,3)} | inference_s={round(last_inference_time,3)} | cpu={system.get('cpu_percent')}% | ram={system.get('ram_percent')}% | gpu={system.get('gpu')}\n")
+        except Exception:
+            pass
+
+        return jsonify({
+            "image": result_b64,
+            "metrics": {
+                "fps": round(fps, 2),
+                "latency_s": round(last_latency, 3),
+                "inference_s": round(last_inference_time, 3),
+                "cpu_percent": last_cpu_percent,
+                "ram_percent": last_ram_percent,
+                "ram_used_mb": last_ram_used_mb,
+                "gpu": last_gpu_info
+            }
+        })
     except Exception as e:
         print(f"Error processing frame: {e}")
         return jsonify({"error": "Failed to process frame"}), 500
@@ -219,7 +284,26 @@ def export_log():
 
 @app.route('/get_stats')
 def get_stats():
-    return jsonify({"stats": stats, "logs": violation_logs, "is_paused": is_paused})
+    system = _collect_system_stats()
+    return jsonify({
+        "stats": stats,
+        "logs": violation_logs,
+        "is_paused": is_paused,
+        "metrics": {
+            "fps": round(fps, 2),
+            "last_frame_latency_s": round(last_latency, 3),
+            "last_inference_s": round(last_inference_time, 3),
+            "cpu_percent": system.get("cpu_percent"),
+            "ram_percent": system.get("ram_percent"),
+            "ram_used_mb": system.get("ram_used_mb"),
+            "gpu": system.get("gpu")
+        },
+        "server": {
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "torch_cuda_available": torch.cuda.is_available()
+        }
+    })
 
 @app.route('/toggle_camera/<action>')
 def toggle_camera(action):
@@ -250,3 +334,52 @@ def serve_snapshot(filename):
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+
+def _query_gpu_via_nvidia_smi():
+    try:
+        out = subprocess.check_output([
+            "nvidia-smi",
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits"
+        ], stderr=subprocess.DEVNULL).decode().strip()
+        # Example line: "GeForce GTX 1080, 8119, 1234, 12"
+        name, mem_total, mem_used, util = [x.strip() for x in out.split(",")]
+        return {"name": name,
+                "memory_total_mb": int(mem_total),
+                "memory_used_mb": int(mem_used),
+                "utilization": int(util)}
+    except Exception:
+        return None
+
+def _collect_system_stats():
+    global last_cpu_percent, last_ram_percent, last_ram_used_mb, last_gpu_info
+    try:
+        last_cpu_percent = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        last_ram_percent = vm.percent
+        last_ram_used_mb = int((vm.total - vm.available) / (1024 * 1024))
+    except Exception:
+        last_cpu_percent = last_ram_percent = last_ram_used_mb = None
+
+    # GPU info: try nvidia-smi, fallback to torch.cuda
+    gpu_info = _query_gpu_via_nvidia_smi()
+    if gpu_info is None and torch.cuda.is_available():
+        try:
+            idx = torch.cuda.current_device()
+            gpu_info = {
+                "name": torch.cuda.get_device_name(idx),
+                "memory_total_mb": int(torch.cuda.get_device_properties(idx).total_memory / (1024 * 1024)),
+                "memory_used_mb": int(torch.cuda.memory_allocated(idx) / (1024 * 1024)),
+                "utilization": None
+            }
+        except Exception:
+            gpu_info = None
+
+    if gpu_info:
+        last_gpu_info = gpu_info
+    return {
+        "cpu_percent": last_cpu_percent,
+        "ram_percent": last_ram_percent,
+        "ram_used_mb": last_ram_used_mb,
+        "gpu": last_gpu_info
+    }
